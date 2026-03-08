@@ -1,0 +1,676 @@
+/**
+ * FreeLang stdlib — supertest
+ *
+ * npm supertest 완전 대체 구현
+ * HTTP 인메모리 통합 테스트 프레임워크
+ *
+ * 실제 서버 기동 없이 App 구조체를 직접 디스패치하여 테스트.
+ * express-compat.fl App 및 test.fl describe/it 과 완전 통합.
+ *
+ * 사용 예시:
+ *   import "stdlib/supertest"
+ *   import "stdlib/test.fl"
+ *
+ *   describe("GET /users", fn() {
+ *     it("200 응답 반환", fn() {
+ *       let res = request(app).get("/users")
+ *         .set("Authorization", "Bearer token123")
+ *         .expect(200)
+ *         .run()
+ *       expect(res.status).toBe(200)
+ *       expect(res.body).toContain("users")
+ *     })
+ *   })
+ *
+ *   // 메서드 체이닝 스타일 (end 콜백)
+ *   describe("POST /login", fn() {
+ *     it("JSON 바디 + 헤더 검증", fn() {
+ *       request(app)
+ *         .post("/login")
+ *         .send({ username: "admin", password: "1234" })
+ *         .set("Content-Type", "application/json")
+ *         .expect(200)
+ *         .expect("Content-Type", "application/json")
+ *         .end(fn(res) {
+ *           expect(res.body.token).toBeTruthy()
+ *         })
+ *     })
+ *   })
+ *
+ *   // 쿼리스트링
+ *   request(app).get("/search")
+ *     .query({ q: "freelang", page: "1" })
+ *     .expect(200)
+ *     .run()
+ *
+ * 네이티브 함수 (src/stdlib-supertest.ts):
+ *   supertest_verify_expectations(responseJson, expectationsJson) → { passed, failures }
+ *   supertest_parse_json(text)                                    → any
+ *   supertest_build_query_string(paramsJson)                      → string
+ *   supertest_json_stringify(value)                               → string
+ */
+
+import { Request, Response, Middleware } from "./express-compat"
+
+// ============================================
+// 상수
+// ============================================
+
+let SUPERTEST_DEFAULT_IP        = "127.0.0.1"
+let SUPERTEST_DEFAULT_USERAGENT = "supertest/FreeLang"
+
+// ============================================
+// Struct 정의
+// ============================================
+
+/**
+ * SupertestResponse: 테스트 요청의 응답 결과
+ */
+struct SupertestResponse {
+  status: int,         // HTTP 상태 코드
+  headers: any,        // map: 응답 헤더
+  body: any,           // 파싱된 응답 바디 (JSON이면 map, 아니면 string)
+  text: string         // 원본 텍스트 응답
+}
+
+/**
+ * SupertestExpectation: 검증 항목
+ *
+ * type:
+ *   "status"      → value = 기대 상태코드 (int)
+ *   "header"      → key = 헤더명, value = 기대 헤더값
+ *   "body"        → value = 기대 바디 (부분 문자열 또는 map 비교)
+ *   "bodyExact"   → value = 바디 전체 일치
+ */
+struct SupertestExpectation {
+  type: string,
+  key: string,
+  value: any
+}
+
+/**
+ * SupertestAgent: 체이닝 요청 빌더
+ *
+ * 각 체이닝 메서드는 내부 상태를 변경하고 자신(self)을 반환.
+ * .run() 또는 .end(fn) 호출 시 인메모리 디스패치 실행.
+ */
+struct SupertestAgent {
+  _app: any,              // express-compat App struct
+  _method: string,        // HTTP 메서드
+  _path: string,          // 요청 경로
+  _headers: any,          // map: 요청 헤더
+  _body: any,             // 요청 바디
+  _queryParams: any,      // map: 쿼리스트링 파라미터
+  _expectations: array,   // SupertestExpectation[]
+
+  // ── HTTP 메서드 선택 ──────────────────────
+  get: fn(string) -> any,
+  post: fn(string) -> any,
+  put: fn(string) -> any,
+  delete: fn(string) -> any,
+  patch: fn(string) -> any,
+  options: fn(string) -> any,
+
+  // ── 요청 설정 ────────────────────────────
+  set: fn(string, string) -> any,    // 헤더 설정
+  send: fn(any) -> any,              // 바디 설정
+  query: fn(any) -> any,             // 쿼리스트링 설정
+
+  // ── 검증 ─────────────────────────────────
+  expect: fn(any, any) -> any,       // 상태코드 / 헤더 / 바디 검증
+
+  // ── 실행 ─────────────────────────────────
+  run: fn() -> SupertestResponse,   // 동기 실행 → 응답 반환
+  end: fn(fn) -> void               // 콜백 스타일 실행
+}
+
+// ============================================
+// 내부 헬퍼: 요청 경로 매칭
+// ============================================
+
+/**
+ * _pathMatches: route 패턴과 실제 경로 일치 여부
+ *
+ * 예) "/users/:id" vs "/users/42" → true
+ *     "/users"     vs "/users"    → true
+ *     "/users/:id" vs "/users"    → false
+ */
+fn _pathMatches(pattern: string, actual: string) -> bool {
+  // 정확 일치
+  if pattern == actual {
+    return true
+  }
+
+  // 파라미터 패턴 처리 (:param)
+  let patternParts = str.split(pattern, "/")
+  let actualParts  = str.split(actual,  "/")
+
+  if arr.length(patternParts) != arr.length(actualParts) {
+    return false
+  }
+
+  let i = 0
+  while i < arr.length(patternParts) {
+    let pp = patternParts[i]
+    let ap = actualParts[i]
+    i = i + 1
+
+    // :param 세그먼트 → 모든 값 허용
+    if str.starts_with(pp, ":") {
+      continue
+    }
+
+    // 와일드카드 *
+    if pp == "*" {
+      return true
+    }
+
+    // 일반 세그먼트 비교
+    if pp != ap {
+      return false
+    }
+  }
+
+  return true
+}
+
+/**
+ * _extractParams: 경로 파라미터 추출
+ * 예) pattern="/users/:id", actual="/users/42" → { id: "42" }
+ */
+fn _extractParams(pattern: string, actual: string) -> any {
+  let params = {}
+  let patternParts = str.split(pattern, "/")
+  let actualParts  = str.split(actual,  "/")
+
+  let i = 0
+  while i < arr.length(patternParts) {
+    let pp = patternParts[i]
+    i = i + 1
+    if str.starts_with(pp, ":") {
+      let paramName = str.slice(pp, 1, str.length(pp))
+      params[paramName] = actualParts[i - 1]
+    }
+  }
+
+  return params
+}
+
+// ============================================
+// 내부 헬퍼: Mock Request 생성
+// ============================================
+
+fn _buildMockRequest(agent: SupertestAgent) -> Request {
+  // 쿼리스트링 조립
+  let queryStr = native_call("supertest_build_query_string", [agent._queryParams])
+  let fullUrl = agent._path
+  if queryStr != "" {
+    fullUrl = agent._path + "?" + queryStr
+  }
+
+  // Content-Type 기본값 설정 (바디가 있으면 application/json)
+  let headers = agent._headers
+  if agent._body != null {
+    if headers["content-type"] == null {
+      headers["content-type"] = "application/json"
+    }
+  }
+
+  let bodyStr = ""
+  if agent._body != null {
+    bodyStr = native_call("supertest_json_stringify", [agent._body])
+  }
+
+  let req: Request = {
+    method:     agent._method,
+    path:       agent._path,
+    url:        fullUrl,
+    query:      agent._queryParams,
+    params:     {},
+    headers:    headers,
+    body:       bodyStr,
+    parsedBody: agent._body,
+    cookies:    {},
+    ip:         SUPERTEST_DEFAULT_IP,
+    userAgent:  SUPERTEST_DEFAULT_USERAGENT
+  }
+
+  return req
+}
+
+// ============================================
+// 내부 헬퍼: Mock Response 생성
+// ============================================
+
+fn _buildMockResponse() -> Response {
+  let res: Response = {
+    status:   200,
+    headers:  {},
+    body:     "",
+    jsonData: null,
+    isSent:   false
+  }
+  return res
+}
+
+// ============================================
+// 내부 헬퍼: Response → SupertestResponse 변환
+// ============================================
+
+fn _toSupertestResponse(res: Response) -> SupertestResponse {
+  let rawText = res.body
+  let parsedBody = null
+
+  // JSON 응답이면 파싱
+  let contentType = res.headers["content-type"]
+  if contentType != null {
+    if str.contains(contentType, "application/json") {
+      parsedBody = native_call("supertest_parse_json", [rawText])
+    }
+  }
+
+  // jsonData 가 있으면 우선 사용
+  if res.jsonData != null {
+    parsedBody = res.jsonData
+    if rawText == "" {
+      rawText = native_call("supertest_json_stringify", [res.jsonData])
+    }
+  }
+
+  if parsedBody == null {
+    parsedBody = rawText
+  }
+
+  return {
+    status:  res.status,
+    headers: res.headers,
+    body:    parsedBody,
+    text:    rawText
+  }
+}
+
+// ============================================
+// 내부 핵심: App 인메모리 디스패치
+// ============================================
+
+/**
+ * _dispatch: FreeLang App 구조체를 통해 인메모리 요청 처리
+ *
+ * 순서:
+ *   1. 미들웨어 순서대로 실행 (false 반환 시 중단)
+ *   2. method + path 매칭 라우트 핸들러 실행
+ *   3. 매칭 없으면 404 반환
+ */
+fn _dispatch(app: any, req: Request, res: Response) -> Response {
+  // 미들웨어 실행
+  let mi = 0
+  while mi < arr.length(app.middlewares) {
+    let middleware = app.middlewares[mi]
+    mi = mi + 1
+    let cont = middleware(req, res)
+    if cont == false {
+      return res
+    }
+  }
+
+  // 라우트 매칭
+  let ri = 0
+  while ri < arr.length(app.routes) {
+    let route = app.routes[ri]
+    ri = ri + 1
+
+    // 메서드 일치 확인 (대소문자 무시)
+    let routeMethod = str.upper(route.method)
+    let reqMethod   = str.upper(req.method)
+
+    if routeMethod != reqMethod && routeMethod != "ALL" {
+      continue
+    }
+
+    // 경로 매칭
+    if !_pathMatches(route.path, req.path) {
+      continue
+    }
+
+    // 경로 파라미터 주입
+    req.params = _extractParams(route.path, req.path)
+
+    // 핸들러 실행
+    route.handler(req, res)
+    return res
+  }
+
+  // 404 — 매칭 라우트 없음
+  res.status = 404
+  res.body   = "Not Found: " + req.method + " " + req.path
+  return res
+}
+
+// ============================================
+// 내부: expectations 검증
+// ============================================
+
+fn _verifyExpectations(agent: SupertestAgent, stRes: SupertestResponse) -> any {
+  let result = native_call("supertest_verify_expectations", [
+    stRes,
+    agent._expectations
+  ])
+  return result
+}
+
+// ============================================
+// 내부: 에이전트 실행
+// ============================================
+
+fn _execute(agent: SupertestAgent) -> SupertestResponse {
+  let req  = _buildMockRequest(agent)
+  let res  = _buildMockResponse()
+  let finalRes = _dispatch(agent._app, req, res)
+  return _toSupertestResponse(finalRes)
+}
+
+// ============================================
+// 공개 API: request(app)
+// ============================================
+
+/**
+ * request(app): SupertestAgent 생성
+ *
+ * app — express-compat 으로 만든 App struct
+ * 반환 — 메서드 체이닝 가능한 SupertestAgent
+ *
+ * 사용:
+ *   let agent = request(myApp)
+ *   agent.get("/api/items").expect(200).run()
+ */
+fn request(app: any) -> SupertestAgent {
+  let agent: SupertestAgent = {
+    _app:          app,
+    _method:       "GET",
+    _path:         "/",
+    _headers:      {},
+    _body:         null,
+    _queryParams:  {},
+    _expectations: [],
+
+    // ── HTTP 메서드 ──────────────────────────
+    get: fn(path: string) -> any {
+      agent._method = "GET"
+      agent._path   = path
+      return agent
+    },
+
+    post: fn(path: string) -> any {
+      agent._method = "POST"
+      agent._path   = path
+      return agent
+    },
+
+    put: fn(path: string) -> any {
+      agent._method = "PUT"
+      agent._path   = path
+      return agent
+    },
+
+    delete: fn(path: string) -> any {
+      agent._method = "DELETE"
+      agent._path   = path
+      return agent
+    },
+
+    patch: fn(path: string) -> any {
+      agent._method = "PATCH"
+      agent._path   = path
+      return agent
+    },
+
+    options: fn(path: string) -> any {
+      agent._method = "OPTIONS"
+      agent._path   = path
+      return agent
+    },
+
+    // ── 요청 설정 ────────────────────────────
+
+    /**
+     * .set(header, value) → 요청 헤더 설정
+     * 예) .set("Authorization", "Bearer token")
+     *     .set("Content-Type", "application/json")
+     */
+    set: fn(header: string, value: string) -> any {
+      agent._headers[str.lower(header)] = value
+      return agent
+    },
+
+    /**
+     * .send(body) → 요청 바디 설정
+     * 문자열, map 모두 허용
+     * 예) .send({ username: "admin", password: "1234" })
+     *     .send("raw text body")
+     */
+    send: fn(body: any) -> any {
+      agent._body = body
+      return agent
+    },
+
+    /**
+     * .query(params) → 쿼리스트링 파라미터 설정
+     * 예) .query({ q: "search", page: "1" })
+     * 결과: GET /search?q=search&page=1
+     */
+    query: fn(params: any) -> any {
+      agent._queryParams = params
+      return agent
+    },
+
+    // ── 검증 (expect 오버로딩) ───────────────
+
+    /**
+     * .expect(arg1, arg2) → 검증 항목 추가
+     *
+     * 오버로딩 규칙:
+     *   .expect(200)                    → 상태코드 검증
+     *   .expect("Content-Type", "json") → 헤더 검증 (부분 일치)
+     *   .expect({ key: val })           → 바디 JSON 검증
+     *   .expect("text")                 → 바디 텍스트 포함 검증
+     */
+    expect: fn(arg1: any, arg2: any) -> any {
+      // 상태코드 검증: .expect(200)
+      if type(arg1) == "number" || type(arg1) == "int" {
+        let exp: SupertestExpectation = {
+          type:  "status",
+          key:   "",
+          value: arg1
+        }
+        arr.push(agent._expectations, exp)
+        return agent
+      }
+
+      // 헤더 검증: .expect("Content-Type", "application/json")
+      if type(arg1) == "string" && arg2 != null {
+        let exp: SupertestExpectation = {
+          type:  "header",
+          key:   str.lower(arg1),
+          value: arg2
+        }
+        arr.push(agent._expectations, exp)
+        return agent
+      }
+
+      // 바디 텍스트 포함 검증: .expect("some text")
+      if type(arg1) == "string" {
+        let exp: SupertestExpectation = {
+          type:  "body",
+          key:   "",
+          value: arg1
+        }
+        arr.push(agent._expectations, exp)
+        return agent
+      }
+
+      // 바디 JSON 검증: .expect({ key: val })
+      if type(arg1) == "object" || type(arg1) == "map" {
+        let exp: SupertestExpectation = {
+          type:  "bodyExact",
+          key:   "",
+          value: arg1
+        }
+        arr.push(agent._expectations, exp)
+        return agent
+      }
+
+      return agent
+    },
+
+    // ── 실행 ─────────────────────────────────
+
+    /**
+     * .run() → 요청 실행 후 SupertestResponse 반환 (동기)
+     *
+     * 검증 실패 시 에러 메시지 출력 (test.fl 과 통합 시
+     * expect() 어서션 실패로 연결)
+     */
+    run: fn() -> SupertestResponse {
+      let res = _execute(agent)
+
+      // expectations 자동 검증
+      let result = _verifyExpectations(agent, res)
+      if result.passed == false {
+        let fi = 0
+        while fi < arr.length(result.failures) {
+          println("[supertest] 검증 실패: " + result.failures[fi])
+          fi = fi + 1
+        }
+      }
+
+      return res
+    },
+
+    /**
+     * .end(callback) → 콜백 스타일 실행
+     *
+     * callback: fn(res: SupertestResponse) -> void
+     *
+     * 예) .end(fn(res) {
+     *       expect(res.status).toBe(200)
+     *       expect(res.body.token).toBeTruthy()
+     *     })
+     */
+    end: fn(callback: fn) -> void {
+      let res = _execute(agent)
+      let result = _verifyExpectations(agent, res)
+
+      if result.passed == false {
+        let fi = 0
+        while fi < arr.length(result.failures) {
+          println("[supertest] 검증 실패: " + result.failures[fi])
+          fi = fi + 1
+        }
+      }
+
+      callback(res)
+    }
+  }
+
+  return agent
+}
+
+// ============================================
+// 편의 함수: 응답 검사 헬퍼
+// ============================================
+
+/**
+ * isOk(res): 200번대 응답인지 확인
+ */
+fn isOk(res: SupertestResponse) -> bool {
+  return res.status >= 200 && res.status < 300
+}
+
+/**
+ * isRedirect(res): 300번대 응답인지 확인
+ */
+fn isRedirect(res: SupertestResponse) -> bool {
+  return res.status >= 300 && res.status < 400
+}
+
+/**
+ * isClientError(res): 400번대 응답인지 확인
+ */
+fn isClientError(res: SupertestResponse) -> bool {
+  return res.status >= 400 && res.status < 500
+}
+
+/**
+ * isServerError(res): 500번대 응답인지 확인
+ */
+fn isServerError(res: SupertestResponse) -> bool {
+  return res.status >= 500
+}
+
+/**
+ * getResponseHeader(res, name): 응답 헤더 값 반환
+ */
+fn getResponseHeader(res: SupertestResponse, name: string) -> string {
+  let val = res.headers[str.lower(name)]
+  if val == null {
+    return ""
+  }
+  return val
+}
+
+/**
+ * assertStatus(res, expected): 상태코드 어서션 (test.fl 연동)
+ *
+ * 예) assertStatus(res, 200)
+ *     assertStatus(res, 404)
+ */
+fn assertStatus(res: SupertestResponse, expected: int) -> void {
+  if res.status != expected {
+    println("[supertest] 상태코드 불일치: expected=" + str(expected) + " received=" + str(res.status))
+  }
+}
+
+/**
+ * assertBodyContains(res, text): 바디에 특정 문자열 포함 어서션
+ */
+fn assertBodyContains(res: SupertestResponse, text: string) -> void {
+  let bodyStr = str(res.body)
+  if !str.contains(bodyStr, text) {
+    println("[supertest] 바디 포함 검증 실패: \"" + text + "\" 없음")
+    println("[supertest] 실제 바디: " + bodyStr)
+  }
+}
+
+/**
+ * assertHeader(res, name, value): 응답 헤더 어서션
+ */
+fn assertHeader(res: SupertestResponse, name: string, value: string) -> void {
+  let actual = getResponseHeader(res, name)
+  if !str.contains(actual, value) {
+    println("[supertest] 헤더 검증 실패: " + name + "=" + actual + " (기대: " + value + ")")
+  }
+}
+
+// ============================================
+// Export
+// ============================================
+
+export {
+  // Struct
+  SupertestResponse,
+  SupertestExpectation,
+  SupertestAgent,
+
+  // 공개 API
+  request,
+
+  // 응답 검사 헬퍼
+  isOk,
+  isRedirect,
+  isClientError,
+  isServerError,
+  getResponseHeader,
+  assertStatus,
+  assertBodyContains,
+  assertHeader
+}
